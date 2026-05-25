@@ -461,6 +461,11 @@
               </FileOption>
             </File>
             <File>
+              <FileName>app_location_report.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/app_location_report.c</FilePath>
+            </File>
+            <File>
               <FileName>usart.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/usart.c</FilePath>

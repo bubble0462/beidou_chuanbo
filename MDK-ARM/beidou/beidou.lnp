@@ -3,6 +3,7 @@
 "beidou\main.o"
 "beidou\gpio.o"
 "beidou\freertos.o"
+"beidou\app_location_report.o"
 "beidou\usart.o"
 "beidou\tim.o"
 "beidou\stm32l4xx_it.o"

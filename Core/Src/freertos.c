@@ -25,10 +25,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_location_report.h"
 #include "gpio.h"
 #include "tim.h"
 #include "usart.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -66,14 +68,15 @@ typedef struct
 #define APP_MAX_LINE_SIZE              255U
 #define APP_BT_QUEUE_DEPTH             4U
 #define APP_MODULE_QUEUE_DEPTH         6U
-#define APP_POWER_OFF_TICKS            300U
+#define APP_POWER_OFF_TICKS            180U
 #define APP_DEBOUNCE_MS                80U
 #define APP_CONTROL_TASK_DELAY_MS      20U
 #define APP_RD_MODE_SETTLE_MS          300U
+#define APP_RN_RD_READY_DELAY_MS       2000U
 
-#define APP_BD2_TEXT_MAX_LEN           24U
+#define APP_BD2_TEXT_MAX_LEN           APP_LOCATION_REPORT_TEXT_MAX_LEN
 #define APP_BD2_HEX_MAX_LEN            (APP_BD2_TEXT_MAX_LEN * 2U)
-#define APP_BD2_FRAME_MAX_LEN          96U
+#define APP_BD2_FRAME_MAX_LEN          220U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -85,16 +88,39 @@ typedef struct
 static const uint8_t kCardQueryCommand[] = "$CCICR,0,00*68\r\n";
 static const uint8_t kBd2TxrEnableCommand[] = "$CCRMO,TXR,2,1*21\r\n";
 
-/* 北二短报文目标地址：0362746 */
-static const char kBd2TargetCardId[] = "0362746";
+/* 北斗短报文卡号存储（可通过蓝牙设置） */
+static char g_selfCardId[16] = "0365966";
+static char g_targetCardId[16] = "0362746";
 
-/* 默认发送内容 */
-static const char kBd2SosText[] = "hello";
+/* 预设常用消息 */
+typedef struct
+{
+  const char *name;
+  const char *text;
+} app_preset_msg_t;
+
+static const app_preset_msg_t kPresetMessages[] =
+{
+  {"hello", "hello"},
+  {"sos",   "SOS"},
+  {"help",  "help"},
+  {"ok",    "ok"},
+  {"test",  "test"},
+};
+static const uint8_t kPresetMessageCount = sizeof(kPresetMessages) / sizeof(kPresetMessages[0]);
 
 static volatile app_mode_t g_currentMode = APP_MODE_RD;
 static uint8_t g_runtimeStarted = 0U;
 static uint32_t g_lastSafeTick = 0U;
 static uint32_t g_lastSosTick = 0U;
+static app_location_reporter_t g_locationReporter;
+
+/* 循环发送状态 */
+#define APP_LOOP_SEND_MSG_MAX_LEN 32U
+static uint8_t g_loopSendEnabled = 0U;
+static uint32_t g_loopSendIntervalMs = 120000UL;
+static uint32_t g_loopSendLastTick = 0U;
+static char g_loopSendMessage[APP_LOOP_SEND_MSG_MAX_LEN + 1U] = "SAFE";
 
 static uint8_t g_btRxByte = 0U;
 static uint8_t g_rdRxByte = 0U;
@@ -122,7 +148,7 @@ const osThreadAttr_t defaultTask_attributes = {
 osThreadId_t btTaskHandle;
 const osThreadAttr_t btTask_attributes = {
   .name = "btTask",
-  .stack_size = 256 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -130,7 +156,7 @@ const osThreadAttr_t btTask_attributes = {
 osThreadId_t moduleTaskHandle;
 const osThreadAttr_t moduleTask_attributes = {
   .name = "moduleTask",
-  .stack_size = 256 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -219,6 +245,16 @@ static uint8_t App_BuildBd2ShortMessage(const char *targetCardId,
 static uint8_t App_EncodeHexText(const char *text, char *hexBuffer, size_t hexBufferSize);
 static uint8_t App_CalcXorChecksum(const char *text);
 static int8_t App_HexNibble(char value);
+
+/* 卡号设置与消息发送 */
+static uint8_t App_SetCardId(char *dest, size_t destSize, const char *src);
+static uint8_t App_SendBd2Message(const char *targetCardId, const char *text);
+static uint8_t App_SendRnLocationReport(const char *text);
+static const char *App_FindPresetMessage(const char *name);
+static void App_HandleSendCommand(const char *command);
+static void App_HandleReportCommand(const char *command);
+static void App_HandleLoopCommand(const char *command);
+static uint8_t App_IsCardIdValid(const char *cardId);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -307,6 +343,24 @@ void StartDefaultTask(void *argument)
       App_SendBtText("SAFE\r\n");
     }
 
+    if ((g_loopSendEnabled != 0U) &&
+        (g_targetCardId[0] != '\0') &&
+        ((uint32_t)(HAL_GetTick() - g_loopSendLastTick) >= g_loopSendIntervalMs))
+    {
+      g_loopSendLastTick = HAL_GetTick();
+      if (App_SendBd2Message(g_targetCardId, g_loopSendMessage) != 0U)
+      {
+        char buf[64];
+        (void)snprintf(buf, sizeof(buf), "Loop sent [%s] to %s\r\n",
+                       g_loopSendMessage, g_targetCardId);
+        App_SendBtText(buf);
+      }
+      else
+      {
+        App_SendBtText("Loop send failed\r\n");
+      }
+    }
+
     osDelay(APP_CONTROL_TASK_DELAY_MS);
   }
 }
@@ -331,6 +385,9 @@ void StartBtTask(void *argument)
 void StartModuleTask(void *argument)
 {
   app_line_msg_t message;
+  char reportPacket[APP_LOCATION_REPORT_TEXT_MAX_LEN + 1U];
+  char diagBuf[80];
+  static uint32_t s_gnssLogTick = 0U;
 
   (void)argument;
 
@@ -342,11 +399,41 @@ void StartModuleTask(void *argument)
       {
         App_HandleModuleMessage(&message);
       }
+      else if ((message.source == APP_UART_SOURCE_RD) && (g_currentMode == APP_MODE_RN))
+      {
+        /* RN模式下透传RD原始数据到蓝牙，便于查看BDFKI等反馈 */
+        App_HandleModuleMessage(&message);
+      }
       else if ((message.source == APP_UART_SOURCE_GNSS) &&
                (g_currentMode == APP_MODE_RN) &&
                (App_IsGnrmcSentence(&message) != 0U))
       {
+        uint32_t nowTick = HAL_GetTick();
         App_HandleModuleMessage(&message);
+        if (AppLocationReport_ProcessRmc(&g_locationReporter,
+                                         (const char *)message.data,
+                                         nowTick,
+                                         reportPacket,
+                                         sizeof(reportPacket)) != 0U)
+        {
+          if (App_SendRnLocationReport(reportPacket) == 0U)
+          {
+            App_SendBtText("RN report send failed\r\n");
+          }
+        }
+        else if ((uint32_t)(nowTick - s_gnssLogTick) >= 30000UL)
+        {
+          /* 每30秒输出一次状态，方便诊断：pts=0说明无定位，elapsed<interval说明时间未到 */
+          s_gnssLogTick = nowTick;
+          uint32_t elapsedS = (uint32_t)(nowTick - g_locationReporter.last_report_ms) / 1000U;
+          uint32_t intervalS = g_locationReporter.interval_ms / 1000U;
+          (void)snprintf(diagBuf, sizeof(diagBuf),
+                         "GNSS: pts=%u el=%lus iv=%lus\r\n",
+                         (unsigned)g_locationReporter.point_count,
+                         (unsigned long)elapsedS,
+                         (unsigned long)intervalS);
+          App_SendBtText(diagBuf);
+        }
       }
     }
   }
@@ -388,6 +475,7 @@ static void App_StartRuntime(void)
   }
 
   (void)HAL_TIM_Base_Start_IT(&htim16);
+  AppLocationReport_Init(&g_locationReporter, HAL_GetTick());
   App_RestartRx(&hlpuart1);
   App_RestartRx(&huart1);
   App_RestartRx(&huart3);
@@ -422,7 +510,8 @@ void App_UartRxCallback(UART_HandleTypeDef *huart)
     }
     else
     {
-      App_ResetRxState(APP_UART_SOURCE_RD);
+      /* RN模式下保留RD数据接收，用于查看BDFKI发送反馈和调试 */
+      App_ProcessRxByteFromIsr(APP_UART_SOURCE_RD, g_rdRxByte);
     }
 
     App_RestartRx(&huart1);
@@ -541,11 +630,112 @@ static void App_HandleBtMessage(const app_line_msg_t *msg)
     return;
   }
 
-  /* 蓝牙发 sos，也直接走北二短报文发给 0362746 */
+  /* 目标卡号设置: target <卡号> */
+  if ((App_CommandEquals(command, "report get") != 0U) ||
+      (App_CommandEquals(command, "report off") != 0U) ||
+      (strncmp(command, "report time ", 12) == 0) ||
+      (strncmp(command, "report sec ", 11) == 0) ||
+      (strncmp(command, "report dist ", 12) == 0))
+  {
+    App_HandleReportCommand(command);
+    return;
+  }
+
+  if ((App_CommandEquals(command, "loop on") != 0U) ||
+      (App_CommandEquals(command, "loop off") != 0U) ||
+      (App_CommandEquals(command, "loop get") != 0U) ||
+      (strncmp(command, "loop on ", 8) == 0) ||
+      (strncmp(command, "loop time ", 10) == 0))
+  {
+    App_HandleLoopCommand(command);
+    return;
+  }
+
+  if ((strncmp(command, "target ", 7) == 0) && (strlen(command) > 7U))
+  {
+    if (App_SetCardId(g_targetCardId, sizeof(g_targetCardId), command + 7) != 0U)
+    {
+      char buf[48];
+      (void)snprintf(buf, sizeof(buf), "Target card set: %s\r\n", g_targetCardId);
+      App_SendBtText(buf);
+    }
+    else
+    {
+      App_SendBtText("Invalid target card ID\r\n");
+    }
+    return;
+  }
+
+  /* 自身卡号设置: self <卡号> */
+  if ((strncmp(command, "self ", 5) == 0) && (strlen(command) > 5U))
+  {
+    if (App_SetCardId(g_selfCardId, sizeof(g_selfCardId), command + 5) != 0U)
+    {
+      char buf[48];
+      (void)snprintf(buf, sizeof(buf), "Self card set: %s\r\n", g_selfCardId);
+      App_SendBtText(buf);
+    }
+    else
+    {
+      App_SendBtText("Invalid self card ID\r\n");
+    }
+    return;
+  }
+
+  /* 查询目标卡号 */
+  if (App_CommandEquals(command, "get target") != 0U)
+  {
+    char buf[48];
+    if (g_targetCardId[0] != '\0')
+    {
+      (void)snprintf(buf, sizeof(buf), "Target card: %s\r\n", g_targetCardId);
+    }
+    else
+    {
+      (void)snprintf(buf, sizeof(buf), "Target card: not set\r\n");
+    }
+    App_SendBtText(buf);
+    return;
+  }
+
+  /* 查询自身卡号 */
+  if (App_CommandEquals(command, "get self") != 0U)
+  {
+    char buf[48];
+    if (g_selfCardId[0] != '\0')
+    {
+      (void)snprintf(buf, sizeof(buf), "Self card: %s\r\n", g_selfCardId);
+    }
+    else
+    {
+      (void)snprintf(buf, sizeof(buf), "Self card: not set\r\n");
+    }
+    App_SendBtText(buf);
+    return;
+  }
+
+  /* 发送自定义内容: send <内容> */
+  if ((strncmp(command, "send ", 5) == 0) && (strlen(command) > 5U))
+  {
+    App_HandleSendCommand(command + 5);
+    return;
+  }
+
+  /* SOS / 一键报平安 -> 发送 SOS 给目标卡号 */
   if (App_CommandEquals(command, "sos") != 0U)
   {
     App_HandleSosAction();
     return;
+  }
+
+  /* 预设消息快捷命令 */
+  {
+    const char *preset = App_FindPresetMessage(command);
+    if (preset != NULL)
+    {
+      App_HandleSendCommand(preset);
+      return;
+    }
   }
 
   if (g_currentMode == APP_MODE_RD)
@@ -592,8 +782,8 @@ static void App_SwitchMode(app_mode_t mode)
   }
   else
   {
-    HAL_GPIO_WritePin(EN_5V_GPIO_Port, EN_5V_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(ENRD_GPIO_Port, ENRD_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(EN_5V_GPIO_Port, EN_5V_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(ENRD_GPIO_Port, ENRD_Pin, GPIO_PIN_SET);
 
     if (previousMode == APP_MODE_RN)
     {
@@ -602,6 +792,8 @@ static void App_SwitchMode(app_mode_t mode)
     else
     {
       App_SendBtText("Switched to RN mode\r\n");
+      osDelay(APP_RN_RD_READY_DELAY_MS);
+      App_SendBtText("RN RD standby ready\r\n");
     }
   }
 }
@@ -724,25 +916,29 @@ static void App_SendRd(const uint8_t *data, uint16_t length)
 
 static void App_HandleSosAction(void)
 {
-  uint8_t frame[APP_BD2_FRAME_MAX_LEN];
-  uint16_t frameLength = 0U;
-
   if (g_currentMode != APP_MODE_RD)
   {
-    App_SendBtText("hello test requires RD mode\r\n");
+    App_SendBtText("SOS requires RD mode\r\n");
     return;
   }
 
-  if (App_BuildBd2ShortMessage(kBd2TargetCardId, kBd2SosText, frame, &frameLength) == 0U)
+  if (g_targetCardId[0] == '\0')
   {
-    App_SendBtText("BD2 frame build failed\r\n");
+    App_SendBtText("Target card not set\r\n");
     return;
   }
 
-  App_SendRd(frame, frameLength);
+  if (App_SendBd2Message(g_targetCardId, "SOS") == 0U)
+  {
+    App_SendBtText("BD2 SOS send failed\r\n");
+    return;
+  }
 
-  App_SendBtText("BD2 message sent to 0362746\r\n");
-  App_SendBt(frame, frameLength);
+  {
+    char buf[64];
+    (void)snprintf(buf, sizeof(buf), "BD2 SOS sent to %s\r\n", g_targetCardId);
+    App_SendBtText(buf);
+  }
 }
 
 static void App_RestartRx(UART_HandleTypeDef *huart)
@@ -1191,6 +1387,351 @@ static int8_t App_HexNibble(char value)
   }
 
   return -1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 卡号设置与消息发送辅助函数                                                  */
+/* -------------------------------------------------------------------------- */
+
+static uint8_t App_IsCardIdValid(const char *cardId)
+{
+  size_t len = 0U;
+  size_t i = 0U;
+
+  if ((cardId == NULL) || (cardId[0] == '\0'))
+  {
+    return 0U;
+  }
+
+  len = strlen(cardId);
+  if ((len < 4U) || (len > 12U))
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < len; i++)
+  {
+    if ((cardId[i] < '0') || (cardId[i] > '9'))
+    {
+      return 0U;
+    }
+  }
+
+  return 1U;
+}
+
+static uint8_t App_SetCardId(char *dest, size_t destSize, const char *src)
+{
+  size_t len = 0U;
+
+  if ((dest == NULL) || (destSize == 0U) || (src == NULL))
+  {
+    return 0U;
+  }
+
+  len = strlen(src);
+  if ((len == 0U) || (len >= destSize))
+  {
+    return 0U;
+  }
+
+  if (App_IsCardIdValid(src) == 0U)
+  {
+    return 0U;
+  }
+
+  (void)strncpy(dest, src, destSize - 1U);
+  dest[destSize - 1U] = '\0';
+  return 1U;
+}
+
+static const char *App_FindPresetMessage(const char *name)
+{
+  if (name == NULL)
+  {
+    return NULL;
+  }
+
+  for (uint8_t i = 0U; i < kPresetMessageCount; i++)
+  {
+    if (strcmp(name, kPresetMessages[i].name) == 0)
+    {
+      return kPresetMessages[i].text;
+    }
+  }
+
+  return NULL;
+}
+
+static uint8_t App_SendBd2Message(const char *targetCardId, const char *text)
+{
+  uint8_t frame[APP_BD2_FRAME_MAX_LEN];
+  uint16_t frameLength = 0U;
+  uint8_t result = 0U;
+
+  if ((targetCardId == NULL) || (text == NULL))
+  {
+    return 0U;
+  }
+
+  result = App_BuildBd2ShortMessage(targetCardId, text, frame, &frameLength);
+  if (result != 0U)
+  {
+    App_SendRd(frame, frameLength);
+    App_SendBt(frame, frameLength);
+    App_SendBtText("\r\n");
+  }
+
+  return result;
+}
+
+static uint8_t App_SendRnLocationReport(const char *text)
+{
+  uint8_t frame[APP_BD2_FRAME_MAX_LEN];
+  uint16_t frameLength = 0U;
+
+  if ((text == NULL) || (text[0] == '\0'))
+  {
+    return 0U;
+  }
+
+  if (g_currentMode != APP_MODE_RN)
+  {
+    return 0U;
+  }
+
+  if (g_targetCardId[0] == '\0')
+  {
+    App_SendBtText("Location report target not set\r\n");
+    return 0U;
+  }
+
+  if (App_BuildBd2ShortMessage(g_targetCardId, text, frame, &frameLength) == 0U)
+  {
+    App_SendBtText("Location report build failed\r\n");
+    return 0U;
+  }
+
+  App_SendBtText("RN report frame: ");
+  App_SendBt(frame, frameLength);
+  App_SendBtText("\r\n");
+  App_SendRd(frame, frameLength);
+
+  App_ResetRxState(APP_UART_SOURCE_RD);
+  App_RestartRx(&huart1);
+  App_RestartRx(&huart3);
+
+  App_SendBtText("RN report sent: ");
+  App_SendBtText(text);
+  App_SendBtText("\r\n");
+  return 1U;
+}
+
+static void App_HandleSendCommand(const char *text)
+{
+  const char *message = NULL;
+
+  if ((text == NULL) || (text[0] == '\0'))
+  {
+    App_SendBtText("Empty message\r\n");
+    return;
+  }
+
+  if (g_currentMode != APP_MODE_RD)
+  {
+    App_SendBtText("Send requires RD mode\r\n");
+    return;
+  }
+
+  if (g_targetCardId[0] == '\0')
+  {
+    App_SendBtText("Target card not set\r\n");
+    return;
+  }
+
+  /* 先尝试匹配预设消息 */
+  message = App_FindPresetMessage(text);
+  if (message == NULL)
+  {
+    message = text;
+  }
+
+  if (App_SendBd2Message(g_targetCardId, message) == 0U)
+  {
+    App_SendBtText("BD2 message build failed\r\n");
+    return;
+  }
+
+  {
+    char buf[80];
+    (void)snprintf(buf, sizeof(buf), "BD2 sent [%s] to %s\r\n", message, g_targetCardId);
+    App_SendBtText(buf);
+  }
+}
+
+static void App_HandleReportCommand(const char *command)
+{
+  char buf[96];
+  char *end = NULL;
+  unsigned long value = 0UL;
+  uint32_t now = HAL_GetTick();
+
+  if (command == NULL)
+  {
+    return;
+  }
+
+  if (App_CommandEquals(command, "report get") != 0U)
+  {
+    uint32_t elapsed_s = (uint32_t)(now - g_locationReporter.last_report_ms) / 1000U;
+    uint32_t interval_s = g_locationReporter.interval_ms / 1000U;
+    AppLocationReport_FormatStatus(&g_locationReporter, buf, sizeof(buf));
+    App_SendBtText(buf);
+    (void)snprintf(buf, sizeof(buf), "Points: %u, elapsed: %lus, interval: %lus\r\n",
+                   (unsigned)g_locationReporter.point_count,
+                   (unsigned long)elapsed_s,
+                   (unsigned long)interval_s);
+    App_SendBtText(buf);
+    return;
+  }
+
+  if (App_CommandEquals(command, "report off") != 0U)
+  {
+    (void)AppLocationReport_SetDefault(&g_locationReporter, now);
+    App_SendBtText("Report default: 2 min\r\n");
+    return;
+  }
+
+  if (strncmp(command, "report time ", 12) == 0)
+  {
+    value = strtoul(command + 12, &end, 10);
+    if ((end == (command + 12)) || (*end != '\0') ||
+        (value > 65535UL) ||
+        (AppLocationReport_SetTimeMinutes(&g_locationReporter, (uint16_t)value, now) == 0U))
+    {
+      App_SendBtText("Invalid report time, must be >= 1 min\r\n");
+      return;
+    }
+
+    (void)snprintf(buf, sizeof(buf), "Report time set: %lu min\r\n", value);
+    App_SendBtText(buf);
+    return;
+  }
+
+  if (strncmp(command, "report sec ", 11) == 0)
+  {
+    value = strtoul(command + 11, &end, 10);
+    if ((end == (command + 11)) || (*end != '\0') ||
+        (value > 4294967UL) ||
+        (AppLocationReport_SetTimeSeconds(&g_locationReporter, (uint32_t)value, now) == 0U))
+    {
+      App_SendBtText("Invalid report sec, must be >= 60 s\r\n");
+      return;
+    }
+
+    (void)snprintf(buf, sizeof(buf), "Report time set: %lu s\r\n", value);
+    App_SendBtText(buf);
+    return;
+  }
+
+  if (strncmp(command, "report dist ", 12) == 0)
+  {
+    value = strtoul(command + 12, &end, 10);
+    if ((end == (command + 12)) || (*end != '\0') ||
+        (value > 4294967295UL) ||
+        (AppLocationReport_SetDistanceMeters(&g_locationReporter, (uint32_t)value, now) == 0U))
+    {
+      App_SendBtText("Invalid report distance, must be >= 500 m\r\n");
+      return;
+    }
+
+    (void)snprintf(buf, sizeof(buf), "Report distance set: %lu m\r\n", value);
+    App_SendBtText(buf);
+    return;
+  }
+
+  App_SendBtText("Unknown report command\r\n");
+}
+
+static void App_HandleLoopCommand(const char *command)
+{
+  char buf[80];
+  char *end = NULL;
+  unsigned long value = 0UL;
+
+  if (command == NULL)
+  {
+    return;
+  }
+
+  if (App_CommandEquals(command, "loop off") != 0U)
+  {
+    g_loopSendEnabled = 0U;
+    App_SendBtText("Loop send disabled\r\n");
+    return;
+  }
+
+  if (App_CommandEquals(command, "loop get") != 0U)
+  {
+    if (g_loopSendEnabled != 0U)
+    {
+      (void)snprintf(buf, sizeof(buf), "Loop: on, msg: %s, interval: %lu min\r\n",
+                     g_loopSendMessage, (unsigned long)(g_loopSendIntervalMs / 60000UL));
+    }
+    else
+    {
+      (void)snprintf(buf, sizeof(buf), "Loop: off\r\n");
+    }
+    App_SendBtText(buf);
+    return;
+  }
+
+  if (strncmp(command, "loop time ", 10) == 0)
+  {
+    value = strtoul(command + 10, &end, 10);
+    if ((end == (command + 10)) || (*end != '\0') ||
+        (value < 1UL) || (value > 65535UL))
+    {
+      App_SendBtText("Invalid loop time, must be >= 1 min\r\n");
+      return;
+    }
+
+    g_loopSendIntervalMs = (uint32_t)value * 60000UL;
+    (void)snprintf(buf, sizeof(buf), "Loop interval: %lu min\r\n", value);
+    App_SendBtText(buf);
+    return;
+  }
+
+  if ((strncmp(command, "loop on ", 8) == 0) && (strlen(command) > 8U))
+  {
+    const char *msg = command + 8;
+    size_t msgLen = strlen(msg);
+
+    if ((msgLen == 0U) || (msgLen > APP_LOOP_SEND_MSG_MAX_LEN))
+    {
+      App_SendBtText("Loop message too long\r\n");
+      return;
+    }
+
+    (void)strncpy(g_loopSendMessage, msg, sizeof(g_loopSendMessage) - 1U);
+    g_loopSendMessage[sizeof(g_loopSendMessage) - 1U] = '\0';
+    g_loopSendEnabled = 1U;
+    g_loopSendLastTick = HAL_GetTick();
+    (void)snprintf(buf, sizeof(buf), "Loop send enabled: %s\r\n", g_loopSendMessage);
+    App_SendBtText(buf);
+    return;
+  }
+
+  if (App_CommandEquals(command, "loop on") != 0U)
+  {
+    g_loopSendEnabled = 1U;
+    g_loopSendLastTick = HAL_GetTick();
+    (void)snprintf(buf, sizeof(buf), "Loop send enabled: %s\r\n", g_loopSendMessage);
+    App_SendBtText(buf);
+    return;
+  }
+
+  App_SendBtText("Unknown loop command\r\n");
 }
 /* USER CODE END Application */
 
