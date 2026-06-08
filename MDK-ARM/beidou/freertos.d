@@ -31,6 +31,9 @@ beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_gpio_ex.h
 beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_dma.h
 beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_ll_dma.h
 beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_cortex.h
+beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_adc.h
+beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_ll_adc.h
+beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_adc_ex.h
 beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_exti.h
 beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_flash.h
 beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_flash_ex.h
@@ -44,9 +47,14 @@ beidou\freertos.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_uart_ex.h
 beidou\freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os.h
 beidou\freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os2.h
 beidou\freertos.o: ../Core/Inc/app_location_report.h
+beidou\freertos.o: ../Core/Inc/adc.h
 beidou\freertos.o: ../Core/Inc/gpio.h
 beidou\freertos.o: ../Core/Inc/tim.h
 beidou\freertos.o: ../Core/Inc/usart.h
+beidou\freertos.o: ../Core/Inc/fence_manager.h
+beidou\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdbool.h
+beidou\freertos.o: ../Core/Inc/fence_algorithm.h
+beidou\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\inttypes.h
 beidou\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
 beidou\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
 beidou\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h

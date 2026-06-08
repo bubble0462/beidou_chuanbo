@@ -1,16 +1,11 @@
 *** Using Compiler 'V5.06 update 5 (build 528)', folder: 'C:\Keil_v5\ARM\ARMCC\Bin'
 Build target 'beidou'
-compiling app_location_report.c...
+compiling fence_manager.c...
 compiling freertos.c...
-../Core/Src/freertos.c(1108): warning:  #177-D: function "App_TryDecodeBdTci"  was declared but never referenced
-  static uint8_t App_TryDecodeBdTci(const app_line_msg_t *msg, uint8_t *decoded, uint16_t *decodedLength)
-../Core/Src/freertos.c(1178): warning:  #177-D: function "App_TryDecodeBdTxr"  was declared but never referenced
-  static uint8_t App_TryDecodeBdTxr(const app_line_msg_t *msg, uint8_t *decoded, uint16_t *decodedLength)
-../Core/Src/freertos.c: 2 warnings, 0 errors
 linking...
 beidou\beidou.axf: Warning: L6989W: Could not apply patch sdcomp-29491-629360 to instruction VPOP     {d8-d12} at offset 0x24, instruction is within an IT block and is not the last instruction for sin_i_x.o(i.____kernel_sin$lsc).
-Program Size: Code=35016 RO-data=1792 RW-data=292 ZI-data=20492  
+Program Size: Code=51700 RO-data=1980 RW-data=292 ZI-data=24676  
 Finished: 0 information, 1 warning and 0 error messages.
 FromELF: creating hex file...
-"beidou\beidou.axf" - 0 Error(s), 3 Warning(s).
-Build Time Elapsed:  00:00:01
+"beidou\beidou.axf" - 0 Error(s), 1 Warning(s).
+Build Time Elapsed:  00:00:03

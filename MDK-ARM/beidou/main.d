@@ -22,6 +22,9 @@ beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_gpio_ex.h
 beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_dma.h
 beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_ll_dma.h
 beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_cortex.h
+beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_adc.h
+beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_ll_adc.h
+beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_adc_ex.h
 beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_exti.h
 beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_flash.h
 beidou\main.o: ../Drivers/STM32L4xx_HAL_Driver/Inc/stm32l4xx_hal_flash_ex.h
@@ -46,3 +49,7 @@ beidou\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os
 beidou\main.o: ../Core/Inc/usart.h
 beidou\main.o: ../Core/Inc/tim.h
 beidou\main.o: ../Core/Inc/gpio.h
+beidou\main.o: ../Core/Inc/adc.h
+beidou\main.o: ../Core/Inc/fence_manager.h
+beidou\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdbool.h
+beidou\main.o: ../Core/Inc/fence_algorithm.h

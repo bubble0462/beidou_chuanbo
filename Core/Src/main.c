@@ -22,10 +22,14 @@
 #include "usart.h"
 #include "tim.h"
 #include "gpio.h"
+#include "adc.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+/* 添加 fence_manager.h 以使围栏模块在工程中可见。
+ * 引用关系：main.c 是程序入口，定义 main() 和 HAL 回调。
+ * 无其他文件引用 main.c。main.c 不读写数据文件。 */
+#include "fence_manager.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -94,6 +98,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USART1_UART_Init();
   MX_TIM16_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */

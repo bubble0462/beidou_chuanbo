@@ -26,9 +26,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app_location_report.h"
+#include "adc.h"
 #include "gpio.h"
 #include "tim.h"
 #include "usart.h"
+#include "fence_manager.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,7 +93,7 @@ static const uint8_t kBd2TxrEnableCommand[] = "$CCRMO,TXR,2,1*21\r\n";
 
 /* 北斗短报文卡号存储（可通过蓝牙设置） */
 static char g_selfCardId[16] = "0365966";
-static char g_targetCardId[16] = "0362746";
+char g_targetCardId[16] = "0362746";
 
 /* 预设常用消息 */
 typedef struct
@@ -221,7 +224,7 @@ static void App_HandlePowerKeyScan(void);
 static void App_ResetRxState(app_uart_source_t source);
 
 static void App_SendBt(const uint8_t *data, uint16_t length);
-static void App_SendBtText(const char *text);
+void App_SendBtText(const char *text);
 static void App_SendRd(const uint8_t *data, uint16_t length);
 
 static void App_HandleSosAction(void);
@@ -248,12 +251,15 @@ static int8_t App_HexNibble(char value);
 
 /* 卡号设置与消息发送 */
 static uint8_t App_SetCardId(char *dest, size_t destSize, const char *src);
-static uint8_t App_SendBd2Message(const char *targetCardId, const char *text);
+uint8_t App_SendBd2Message(const char *targetCardId, const char *text);
 static uint8_t App_SendRnLocationReport(const char *text);
 static const char *App_FindPresetMessage(const char *name);
 static void App_HandleSendCommand(const char *command);
 static void App_HandleReportCommand(const char *command);
 static void App_HandleLoopCommand(const char *command);
+static void App_HandleFenceSetCommand(const char *params);
+static void App_HandleFenceDelCommand(const char *params);
+static uint8_t App_HandleCompactFenceCmd(const char *text);
 static uint8_t App_IsCardIdValid(const char *cardId);
 /* USER CODE END FunctionPrototypes */
 
@@ -409,6 +415,15 @@ void StartModuleTask(void *argument)
                (App_IsGnrmcSentence(&message) != 0U))
       {
         uint32_t nowTick = HAL_GetTick();
+        app_location_point_t point;
+
+        /* 解析RMC用于电子围栏检测 */
+        if (AppLocationReport_ParseRmc((const char *)message.data, &point) != 0U)
+        {
+          fence_check_location(point.lat_nmea, point.lat_dir,
+                               point.lon_nmea, point.lon_dir);
+        }
+
         App_HandleModuleMessage(&message);
         if (AppLocationReport_ProcessRmc(&g_locationReporter,
                                          (const char *)message.data,
@@ -439,6 +454,32 @@ void StartModuleTask(void *argument)
   }
 }
 
+/**
+ * @brief  Read battery voltage and report via Bluetooth
+ * @note   3600mV = 0%, 4100mV = 100%, linear interpolation, clamped
+ */
+static void App_ReportBattery(void)
+{
+  uint32_t vbat_mV = App_ReadVbat_mV();
+  uint8_t pct = 0U;
+  if (vbat_mV >= 4100U)
+  {
+    pct = 100U;
+  }
+  else if (vbat_mV > 3600U)
+  {
+    pct = (uint8_t)((vbat_mV - 3600U) * 100U / 500U);
+  }
+  else
+  {
+    pct = 0U;
+  }
+  char buf[48];
+  (void)snprintf(buf, sizeof(buf), "Battery: %lumV %u%%\r\n",
+                 (unsigned long)vbat_mV, (unsigned)pct);
+  App_SendBtText(buf);
+}
+
 static void App_StartRuntime(void)
 {
   if (g_runtimeStarted != 0U)
@@ -449,6 +490,9 @@ static void App_StartRuntime(void)
   g_runtimeStarted = 1U;
 
   HAL_GPIO_WritePin(POWER_KEEP_GPIO_Port, POWER_KEEP_Pin, GPIO_PIN_SET);
+
+  /* Wait for power supply to stabilize after POWER_KEEP latch */
+  osDelay(500U);
 
   App_ResetRxState(APP_UART_SOURCE_BT);
   App_ResetRxState(APP_UART_SOURCE_RD);
@@ -483,6 +527,9 @@ static void App_StartRuntime(void)
   g_currentMode = APP_MODE_RN;
   App_SwitchMode(APP_MODE_RD);
   App_SendBtText("System ready. Default mode: RD\r\n");
+
+  /* Report battery status after power stabilized */
+  App_ReportBattery();
 }
 
 void App_ControlInit(void)
@@ -728,6 +775,31 @@ static void App_HandleBtMessage(const app_line_msg_t *msg)
     return;
   }
 
+  if (App_CommandEquals(command, "battery") != 0U)
+  {
+    App_ReportBattery();
+    return;
+  }
+
+  /* 围栏命令 */
+  if (strncmp(command, "set_fence:", 10) == 0)
+  {
+    App_HandleFenceSetCommand(command + 10);
+    return;
+  }
+
+  if (strncmp(command, "del_fence:", 10) == 0)
+  {
+    App_HandleFenceDelCommand(command + 10);
+    return;
+  }
+
+  if (App_CommandEquals(command, "list_fence") != 0U)
+  {
+    fence_list_all();
+    return;
+  }
+
   /* 预设消息快捷命令 */
   {
     const char *preset = App_FindPresetMessage(command);
@@ -746,9 +818,31 @@ static void App_HandleBtMessage(const app_line_msg_t *msg)
 
 static void App_HandleModuleMessage(const app_line_msg_t *msg)
 {
+  uint8_t decoded[256];
+  uint16_t decodedLen = 0U;
+
   if ((msg == NULL) || (msg->length == 0U))
   {
     return;
+  }
+
+  /* 尝试解码北斗短报文，如果是岸基围栏配置则额外转发给App */
+  if ((App_TryDecodeBdTci(msg, decoded, &decodedLen) != 0U) ||
+      (App_TryDecodeBdTxr(msg, decoded, &decodedLen) != 0U))
+  {
+    decoded[decodedLen] = '\0';
+
+    if (strncmp((const char *)decoded, "SET_FENCE:", 10) == 0)
+    {
+      /* 旧格式兼容 */
+      char buf[256];
+      (void)snprintf(buf, sizeof(buf), "FENCE_CFG:%s\r\n", (const char *)decoded + 10);
+      App_SendBtText(buf);
+    }
+    else if (App_HandleCompactFenceCmd((const char *)decoded) != 0U)
+    {
+      /* 新紧凑格式 FC/FP/FQ 已在函数内部处理 */
+    }
   }
 
   App_SendBt(msg->data, msg->length);
@@ -890,7 +984,7 @@ static void App_SendBt(const uint8_t *data, uint16_t length)
   }
 }
 
-static void App_SendBtText(const char *text)
+void App_SendBtText(const char *text)
 {
   if (text == NULL)
   {
@@ -1463,7 +1557,7 @@ static const char *App_FindPresetMessage(const char *name)
   return NULL;
 }
 
-static uint8_t App_SendBd2Message(const char *targetCardId, const char *text)
+uint8_t App_SendBd2Message(const char *targetCardId, const char *text)
 {
   uint8_t frame[APP_BD2_FRAME_MAX_LEN];
   uint16_t frameLength = 0U;
@@ -1732,6 +1826,359 @@ static void App_HandleLoopCommand(const char *command)
   }
 
   App_SendBtText("Unknown loop command\r\n");
+}
+
+/* ==========================================================
+ * 围栏命令处理
+ * ========================================================== */
+
+static void App_HandleFenceSetCommand(const char *params)
+{
+  char buf[64];
+
+  if ((params == NULL) || (params[0] == '\0'))
+  {
+    App_SendBtText("Invalid fence params\r\n");
+    return;
+  }
+
+  /* 圆形: set_fence:c,id,lat,lng,radius */
+  if ((params[0] == 'c') && (params[1] == ','))
+  {
+    uint32_t id = 0U;
+    double lat = 0.0;
+    double lng = 0.0;
+    double radius = 0.0;
+
+    if (sscanf(params + 2, "%lu,%lf,%lf,%lf", &id, &lat, &lng, &radius) == 4)
+    {
+      fence_add_circle(id, lat, lng, radius);
+      (void)snprintf(buf, sizeof(buf), "Fence set: C ID=%lu\r\n", id);
+      App_SendBtText(buf);
+    }
+    else
+    {
+      App_SendBtText("Invalid circle fence params\r\n");
+    }
+    return;
+  }
+
+  /* 多边形: set_fence:p,id,vertex_count,lat1,lng1,lat2,lng2,... */
+  if ((params[0] == 'p') && (params[1] == ','))
+  {
+    uint32_t id = 0U;
+    int vertex_count = 0;
+    double vertices[FENCE_MAX_VERTICES][2];
+    const char *p = params + 2;
+    int parsed = 0;
+    int i;
+
+    if (sscanf(p, "%lu,%d", &id, &vertex_count) != 2)
+    {
+      App_SendBtText("Invalid polygon fence params\r\n");
+      return;
+    }
+
+    if ((vertex_count < 3) || (vertex_count > FENCE_MAX_VERTICES))
+    {
+      App_SendBtText("Invalid vertex count\r\n");
+      return;
+    }
+
+    /* 跳过 id,vertex_count 部分，定位到第一个坐标 */
+    {
+      int comma_count = 0;
+      while ((*p != '\0') && (comma_count < 2))
+      {
+        if (*p == ',')
+        {
+          comma_count++;
+        }
+        p++;
+      }
+    }
+
+    for (i = 0; (i < vertex_count) && (*p != '\0'); i++)
+    {
+      double lat = 0.0;
+      double lng = 0.0;
+      int n = 0;
+
+      n = sscanf(p, "%lf,%lf", &lat, &lng);
+      if (n != 2)
+      {
+        break;
+      }
+      vertices[i][0] = lng;  /* 经度 */
+      vertices[i][1] = lat;  /* 纬度 */
+      parsed++;
+
+      /* 跳过这对坐标 */
+      {
+        int comma_count = 0;
+        while ((*p != '\0') && (comma_count < 2))
+        {
+          if (*p == ',')
+          {
+            comma_count++;
+          }
+          p++;
+        }
+      }
+    }
+
+    if (parsed == vertex_count)
+    {
+      fence_add_polygon(id, (const double (*)[2])vertices, vertex_count);
+      (void)snprintf(buf, sizeof(buf), "Fence set: P ID=%lu N=%d\r\n", id, vertex_count);
+      App_SendBtText(buf);
+    }
+    else
+    {
+      App_SendBtText("Invalid polygon vertex data\r\n");
+    }
+    return;
+  }
+
+  App_SendBtText("Unknown fence type, use c or p\r\n");
+}
+
+static void App_HandleFenceDelCommand(const char *params)
+{
+  char buf[48];
+  uint32_t id = 0U;
+
+  if ((params == NULL) || (params[0] == '\0'))
+  {
+    App_SendBtText("Invalid fence ID\r\n");
+    return;
+  }
+
+  id = strtoul(params, NULL, 10);
+  fence_remove(id);
+  (void)snprintf(buf, sizeof(buf), "Fence removed: ID=%" PRIu32 "\r\n", id);
+  App_SendBtText(buf);
+}
+
+/* ==========================================================
+ * 辅助函数：将6位纬度raw补零为9位(NMEA 5dp)，7位经度raw补零为10位
+ * 然后调用 fence_nmea_to_decimal_deg 转换
+ * ========================================================== */
+static double App_PaddedNmeaToDec(uint32_t raw, int digits, char dir)
+{
+  /* 补零到标准 NMEA 位数（纬度9位，经度10位） */
+  int target = (dir != '\0') ? 9 : 10; /* 不使用 dir 区分，用 digits */
+  (void)target;
+  (void)digits;
+
+  /* 纬度补3个0(6→9位)，经度补3个0(7→10位) */
+  raw = raw * 1000U;
+
+  return fence_nmea_to_decimal_deg(raw, dir);
+}
+
+/* ==========================================================
+ * 从逗号分隔字符串中解析下一个整数字段，返回指针偏移
+ * ========================================================== */
+static const char *App_ParseNextInt(const char *p, int32_t *out)
+{
+  char *end = NULL;
+  long val = strtol(p, &end, 10);
+  if (end == p)
+  {
+    return NULL;
+  }
+  *out = (int32_t)val;
+  /* 跳过逗号 */
+  if (*end == ',')
+  {
+    end++;
+  }
+  return (const char *)end;
+}
+
+static const char *App_ParseNextUint(const char *p, uint32_t *out)
+{
+  char *end = NULL;
+  unsigned long val = strtoul(p, &end, 10);
+  if (end == p)
+  {
+    return NULL;
+  }
+  *out = (uint32_t)val;
+  if (*end == ',')
+  {
+    end++;
+  }
+  return (const char *)end;
+}
+
+/* ==========================================================
+ * 紧凑围栏命令解析（FC/FP/FQ）
+ * 由 App_HandleModuleMessage 中解码短报文后调用
+ * 返回 1 表示已处理，0 表示不匹配
+ * ========================================================== */
+static uint8_t App_HandleCompactFenceCmd(const char *text)
+{
+  char bt_buf[256];
+  const char *p;
+
+  if ((text == NULL) || (text[0] != 'F'))
+  {
+    return 0U;
+  }
+
+  /* ---- FC: 圆形围栏 ---- FC<id>,<lat6>,<lng7>,<radius> */
+  if ((text[1] == 'C') && (text[2] >= '0') && (text[2] <= '9'))
+  {
+    uint32_t id = 0U;
+    uint32_t lat_raw = 0U;
+    uint32_t lng_raw = 0U;
+    uint32_t radius = 0U;
+
+    p = &text[2];
+    p = App_ParseNextUint(p, &id);
+    if (p == NULL) { return 0U; }
+    p = App_ParseNextUint(p, &lat_raw);
+    if (p == NULL) { return 0U; }
+    p = App_ParseNextUint(p, &lng_raw);
+    if (p == NULL) { return 0U; }
+    p = App_ParseNextUint(p, &radius);
+    if (p == NULL) { return 0U; }
+
+    double lat = App_PaddedNmeaToDec(lat_raw, 6, 'N');
+    double lng = App_PaddedNmeaToDec(lng_raw, 7, 'E');
+
+    fence_add_circle(id, lat, lng, (double)radius);
+
+    /* 蓝牙转发标准 FENCE_CFG 格式给App */
+    (void)snprintf(bt_buf, sizeof(bt_buf),
+                   "FENCE_CFG:C,%" PRIu32 ",%.5f,%.5f,%.1f\r\n",
+                   id, lat, lng, (double)radius);
+    App_SendBtText(bt_buf);
+    return 1U;
+  }
+
+  /* ---- FP: 多边形绝对坐标 ---- FP<id>,<lat6>,<lng7>,<lat6>,<lng7>,... */
+  if ((text[1] == 'P') && (text[2] >= '0') && (text[2] <= '9'))
+  {
+    uint32_t id = 0U;
+    double vertices[FENCE_MAX_VERTICES][2];
+    int count = 0;
+
+    p = &text[2];
+    p = App_ParseNextUint(p, &id);
+    if (p == NULL) { return 0U; }
+
+    /* 交替解析纬度6位+经度7位 */
+    while ((*p != '\0') && (*p != '\r') && (*p != '\n') && (count < FENCE_MAX_VERTICES))
+    {
+      uint32_t lat_raw = 0U;
+      uint32_t lng_raw = 0U;
+      const char *next;
+
+      next = App_ParseNextUint(p, &lat_raw);
+      if (next == NULL) { break; }
+      p = next;
+
+      next = App_ParseNextUint(p, &lng_raw);
+      if (next == NULL) { break; }
+      p = next;
+
+      vertices[count][0] = App_PaddedNmeaToDec(lng_raw, 7, 'E'); /* 经度 */
+      vertices[count][1] = App_PaddedNmeaToDec(lat_raw, 6, 'N'); /* 纬度 */
+      count++;
+    }
+
+    if (count >= 3)
+    {
+      int i;
+      fence_add_polygon(id, (const double (*)[2])vertices, count);
+
+      /* 蓝牙转发标准 FENCE_CFG:P 格式给App */
+      int offset = snprintf(bt_buf, sizeof(bt_buf),
+                            "FENCE_CFG:P,%" PRIu32 ",%d", id, count);
+      for (i = 0; (i < count) && (offset < 240); i++)
+      {
+        offset += snprintf(bt_buf + offset, sizeof(bt_buf) - (size_t)offset,
+                           ",%.5f,%.5f", vertices[i][1], vertices[i][0]);
+      }
+      bt_buf[offset++] = '\r';
+      bt_buf[offset++] = '\n';
+      bt_buf[offset] = '\0';
+      App_SendBtText(bt_buf);
+      return 1U;
+    }
+    return 0U;
+  }
+
+  /* ---- FQ: 多边形偏移编码 ---- FQ<id>,<lat6>,<lng7>,<dlat>,<dlng>,... */
+  if ((text[1] == 'Q') && (text[2] >= '0') && (text[2] <= '9'))
+  {
+    uint32_t id = 0U;
+    uint32_t lat0_raw = 0U;
+    uint32_t lng0_raw = 0U;
+    double vertices[FENCE_MAX_VERTICES][2];
+    int count = 0;
+
+    p = &text[2];
+    p = App_ParseNextUint(p, &id);
+    if (p == NULL) { return 0U; }
+    p = App_ParseNextUint(p, &lat0_raw);
+    if (p == NULL) { return 0U; }
+    p = App_ParseNextUint(p, &lng0_raw);
+    if (p == NULL) { return 0U; }
+
+    /* 基准点（第1个顶点） */
+    double base_lat = App_PaddedNmeaToDec(lat0_raw, 6, 'N');
+    double base_lng = App_PaddedNmeaToDec(lng0_raw, 7, 'E');
+    vertices[0][0] = base_lng; /* 经度 */
+    vertices[0][1] = base_lat; /* 纬度 */
+    count = 1;
+
+    /* 后续顶点为偏移量（单位 0.001° ≈ 111m） */
+    while ((*p != '\0') && (*p != '\r') && (*p != '\n') && (count < FENCE_MAX_VERTICES))
+    {
+      int32_t dlat = 0;
+      int32_t dlng = 0;
+      const char *next;
+
+      next = App_ParseNextInt(p, &dlat);
+      if (next == NULL) { break; }
+      p = next;
+
+      next = App_ParseNextInt(p, &dlng);
+      if (next == NULL) { break; }
+      p = next;
+
+      vertices[count][1] = base_lat + ((double)dlat * 0.001); /* 纬度 */
+      vertices[count][0] = base_lng + ((double)dlng * 0.001); /* 经度 */
+      count++;
+    }
+
+    if (count >= 3)
+    {
+      int i;
+      fence_add_polygon(id, (const double (*)[2])vertices, count);
+
+      /* 蓝牙转发展开后的标准 FENCE_CFG:P 格式 */
+      int offset = snprintf(bt_buf, sizeof(bt_buf),
+                            "FENCE_CFG:P,%" PRIu32 ",%d", id, count);
+      for (i = 0; (i < count) && (offset < 240); i++)
+      {
+        offset += snprintf(bt_buf + offset, sizeof(bt_buf) - (size_t)offset,
+                           ",%.5f,%.5f", vertices[i][1], vertices[i][0]);
+      }
+      bt_buf[offset++] = '\r';
+      bt_buf[offset++] = '\n';
+      bt_buf[offset] = '\0';
+      App_SendBtText(bt_buf);
+      return 1U;
+    }
+    return 0U;
+  }
+
+  return 0U;
 }
 /* USER CODE END Application */
 
