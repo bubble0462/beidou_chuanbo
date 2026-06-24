@@ -36,7 +36,14 @@ typedef struct
   double min_lng, min_lat, max_lng, max_lat;  /* AABB包围盒 */
 } fence_polygon_t;
 
-/* NMEA uint32_t raw 转十进制度数 */
+/* NMEA uint32_t raw 转十进制度数
+ * 输入约定（R5 已核实，三处路径一致）：nmea_raw = NMEA 度分格式 ddmm.mmmmm
+ *           去掉小数点后的整数——纬度 9 位（dd=2 + mm.mmmmm=7），
+ *           经度 10 位（ddd=3 + mm.mmmmm=7）。内部按"7 位分小数"解析
+ *           （÷1e7 取度，余数÷1e5 为分×1e5）。
+ *           - RMC 直传路径：AppLocationReport_ParseRmc 产出 9/10 位，直接调用即可。
+ *           - 岸基紧凑格式（纬 6 位/经 7 位）：须先 ×1000 补齐到 9/10 位再调用
+ *             （见 freertos.c App_PaddedNmeaToDec）。 */
 double fence_nmea_to_decimal_deg(uint32_t nmea_raw, char dir);
 
 /* Haversine 距离计算（米） */
@@ -45,7 +52,9 @@ double fence_distance_meters(double lat1, double lng1, double lat2, double lng2)
 /* 更新多边形包围盒 */
 void fence_update_bounding_box(fence_polygon_t *poly);
 
-/* 点在多边形内判定（优化环绕数法 + AABB预剔除） */
+/* 点在多边形内判定（优化环绕数法 + AABB预剔除）
+ * 已知假设（R6）：把经纬度当平面坐标计算 cross 积，属平面近似。
+ * 仅适用于小范围（<10km）、中低纬度多边形；港口/近海电子围栏误差可忽略。 */
 bool fence_point_in_polygon(fence_point_t p, const fence_polygon_t *poly);
 
 #endif /* FENCE_ALGORITHM_H */

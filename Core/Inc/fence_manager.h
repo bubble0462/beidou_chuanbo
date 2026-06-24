@@ -20,6 +20,13 @@
 
 #define MAX_FENCES 10
 
+/* 报警防抖（R1）：状态翻转需连续 FENCE_CONFIRM_SAMPLES 次同方向采样才确认。
+ * 2Hz 采样下 3 次 ≈ 1.5s，过滤 GPS 边界抖动导致的报警刷屏。 */
+#define FENCE_CONFIRM_SAMPLES 3U
+
+/* 圆形围栏半径上限（米，R7），防止误下发巨型围栏 */
+#define FENCE_MAX_RADIUS_M     50000.0
+
 /* 围栏类型枚举 */
 typedef enum
 {
@@ -43,16 +50,20 @@ typedef struct
   fence_type_t type;         /* 围栏类型 */
   fence_polygon_t poly;      /* 多边形数据（type=POLYGON时有效） */
   fence_circle_t  circle;    /* 圆形数据（type=CIRCLE时有效） */
-  uint8_t      last_state;   /* 0=未知, 1=在内, 2=在外 */
+  uint8_t      last_state;     /* 0=未知, 1=在内, 2=在外（已确认状态） */
+  uint8_t      pending_state;  /* 待确认的新状态（R1 防抖，0=无待确认） */
+  uint8_t      confirm_count;  /* pending_state 的连续确认次数（R1 防抖） */
 } fence_t;
 
 extern fence_t fence_list[MAX_FENCES];
 
-/* 添加多边形围栏：vertices[][0]=经度, vertices[][1]=纬度 */
-void fence_add_polygon(uint32_t id, const double vertices[][2], int vertex_count);
+/* 添加多边形围栏：vertices[][0]=经度, vertices[][1]=纬度
+ * 成功返回 true；顶点数非法或围栏列表已满返回 false（R4） */
+bool fence_add_polygon(uint32_t id, const double vertices[][2], int vertex_count);
 
-/* 添加圆形围栏 */
-void fence_add_circle(uint32_t id, double lat, double lng, double radius_m);
+/* 添加圆形围栏
+ * 成功返回 true；半径非法/超限（R7）或围栏列表已满（R4）返回 false */
+bool fence_add_circle(uint32_t id, double lat, double lng, double radius_m);
 
 /* 删除围栏 */
 void fence_remove(uint32_t id);

@@ -55,10 +55,13 @@ static void fence_send_alarm(const char *type, uint32_t fence_id,
                  "ALARM:%s,FENCE:%" PRIu32 ",LAT:%.5f,LNG:%.5f\r\n",
                  type, fence_id, lat, lng);
 
-  /* 双发 */
+  /* 双发：北斗短报文 + 蓝牙文本。检查北斗发送返回值（R2），失败时蓝牙回执。 */
   if (g_targetCardId[0] != '\0')
   {
-    (void)App_SendBd2Message(g_targetCardId, bd_msg);
+    if (App_SendBd2Message(g_targetCardId, bd_msg) == 0U)
+    {
+      App_SendBtText("FENCE BD send failed\r\n");
+    }
   }
   App_SendBtText(bt_msg);
 }
@@ -67,14 +70,14 @@ static void fence_send_alarm(const char *type, uint32_t fence_id,
  * 添加多边形围栏
  * vertices[][0] = 经度, vertices[][1] = 纬度
  * ========================================================== */
-void fence_add_polygon(uint32_t id, const double vertices[][2], int vertex_count)
+bool fence_add_polygon(uint32_t id, const double vertices[][2], int vertex_count)
 {
   int idx = -1;
   int i;
 
   if ((vertex_count < 3) || (vertex_count > FENCE_MAX_VERTICES))
   {
-    return;
+    return false;
   }
 
   /* 查找同名围栏或空位 */
@@ -93,13 +96,15 @@ void fence_add_polygon(uint32_t id, const double vertices[][2], int vertex_count
 
   if (idx < 0)
   {
-    return;
+    return false;
   }
 
   fence_list[idx].is_active = true;
   fence_list[idx].fence_id  = id;
   fence_list[idx].type      = FENCE_TYPE_POLYGON;
   fence_list[idx].last_state = 0;
+  fence_list[idx].pending_state = 0;   /* R1 防抖状态复位 */
+  fence_list[idx].confirm_count = 0;
 
   fence_list[idx].poly.vertex_count = vertex_count;
   for (i = 0; i < vertex_count; i++)
@@ -108,19 +113,21 @@ void fence_add_polygon(uint32_t id, const double vertices[][2], int vertex_count
     fence_list[idx].poly.vertices[i].lat = vertices[i][1];
   }
   fence_update_bounding_box(&fence_list[idx].poly);
+  return true;
 }
 
 /* ==========================================================
  * 添加圆形围栏
  * ========================================================== */
-void fence_add_circle(uint32_t id, double lat, double lng, double radius_m)
+bool fence_add_circle(uint32_t id, double lat, double lng, double radius_m)
 {
   int idx = -1;
   int i;
 
-  if (radius_m <= 0.0)
+  /* R7：半径必须为正且不超上限，拒绝误下发的巨型围栏 */
+  if ((radius_m <= 0.0) || (radius_m > FENCE_MAX_RADIUS_M))
   {
-    return;
+    return false;
   }
 
   for (i = 0; i < MAX_FENCES; i++)
@@ -138,16 +145,19 @@ void fence_add_circle(uint32_t id, double lat, double lng, double radius_m)
 
   if (idx < 0)
   {
-    return;
+    return false;
   }
 
   fence_list[idx].is_active = true;
   fence_list[idx].fence_id  = id;
   fence_list[idx].type      = FENCE_TYPE_CIRCLE;
   fence_list[idx].last_state = 0;
+  fence_list[idx].pending_state = 0;   /* R1 防抖状态复位 */
+  fence_list[idx].confirm_count = 0;
   fence_list[idx].circle.center_lat = lat;
   fence_list[idx].circle.center_lng = lng;
   fence_list[idx].circle.radius_m   = radius_m;
+  return true;
 }
 
 /* ==========================================================
@@ -163,6 +173,8 @@ void fence_remove(uint32_t id)
     {
       fence_list[i].is_active = false;
       fence_list[i].last_state = 0;
+      fence_list[i].pending_state = 0;   /* R1 防抖状态复位 */
+      fence_list[i].confirm_count = 0;
     }
   }
 }
@@ -218,22 +230,55 @@ void fence_check_location(uint32_t lat_nmea, char lat_dir,
 
     curr_state = is_inside ? 1U : 2U;
 
-    /* 状态变化检测（忽略首次未知状态） */
-    if (f->last_state != 0U)
+    /* ── R1 报警防抖 ──
+     * 首次观测建立基线状态（不发报警）；
+     * 后续状态翻转需连续 FENCE_CONFIRM_SAMPLES 次同方向采样才确认，
+     * 过滤 GPS 边界抖动导致的 ENTER/EXIT 刷屏。 */
+    if (f->last_state == 0U)
     {
-      if ((f->last_state == 1U) && (curr_state == 2U))
-      {
-        /* 驶出围栏 */
-        fence_send_alarm("EXIT", f->fence_id, current_lat, current_lng);
-      }
-      else if ((f->last_state == 2U) && (curr_state == 1U))
-      {
-        /* 驶入围栏 */
-        fence_send_alarm("ENTER", f->fence_id, current_lat, current_lng);
-      }
+      f->last_state = curr_state;
+      f->pending_state = 0U;
+      f->confirm_count = 0U;
+      continue;
     }
 
-    f->last_state = curr_state;
+    if (curr_state == f->last_state)
+    {
+      /* 状态未变：清空待确认 */
+      f->pending_state = 0U;
+      f->confirm_count = 0U;
+    }
+    else
+    {
+      /* 状态可能翻转：累积连续确认次数 */
+      if (curr_state == f->pending_state)
+      {
+        f->confirm_count++;
+      }
+      else
+      {
+        f->pending_state = curr_state;
+        f->confirm_count = 1U;
+      }
+
+      if (f->confirm_count >= FENCE_CONFIRM_SAMPLES)
+      {
+        /* 连续多次确认，判定状态翻转并报警 */
+        if (f->last_state == 1U)
+        {
+          /* 驶出围栏 */
+          fence_send_alarm("EXIT", f->fence_id, current_lat, current_lng);
+        }
+        else
+        {
+          /* 驶入围栏 */
+          fence_send_alarm("ENTER", f->fence_id, current_lat, current_lng);
+        }
+        f->last_state = f->pending_state;
+        f->pending_state = 0U;
+        f->confirm_count = 0U;
+      }
+    }
   }
 }
 

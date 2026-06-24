@@ -1852,8 +1852,14 @@ static void App_HandleFenceSetCommand(const char *params)
 
     if (sscanf(params + 2, "%lu,%lf,%lf,%lf", &id, &lat, &lng, &radius) == 4)
     {
-      fence_add_circle(id, lat, lng, radius);
-      (void)snprintf(buf, sizeof(buf), "Fence set: C ID=%lu\r\n", id);
+      if (fence_add_circle(id, lat, lng, radius))
+      {
+        (void)snprintf(buf, sizeof(buf), "Fence set: C ID=%lu\r\n", id);
+      }
+      else
+      {
+        (void)snprintf(buf, sizeof(buf), "Fence set FAILED: C ID=%lu\r\n", id);
+      }
       App_SendBtText(buf);
     }
     else
@@ -1929,8 +1935,14 @@ static void App_HandleFenceSetCommand(const char *params)
 
     if (parsed == vertex_count)
     {
-      fence_add_polygon(id, (const double (*)[2])vertices, vertex_count);
-      (void)snprintf(buf, sizeof(buf), "Fence set: P ID=%lu N=%d\r\n", id, vertex_count);
+      if (fence_add_polygon(id, (const double (*)[2])vertices, vertex_count))
+      {
+        (void)snprintf(buf, sizeof(buf), "Fence set: P ID=%lu N=%d\r\n", id, vertex_count);
+      }
+      else
+      {
+        (void)snprintf(buf, sizeof(buf), "Fence set FAILED: P ID=%lu N=%d\r\n", id, vertex_count);
+      }
       App_SendBtText(buf);
     }
     else
@@ -2049,7 +2061,11 @@ static uint8_t App_HandleCompactFenceCmd(const char *text)
     double lat = App_PaddedNmeaToDec(lat_raw, 6, 'N');
     double lng = App_PaddedNmeaToDec(lng_raw, 7, 'E');
 
-    fence_add_circle(id, lat, lng, (double)radius);
+    if (!fence_add_circle(id, lat, lng, (double)radius))
+    {
+      App_SendBtText("Fence set FAILED: FC invalid or list full\r\n");
+      return 1U;
+    }
 
     /* 蓝牙转发标准 FENCE_CFG 格式给App */
     (void)snprintf(bt_buf, sizeof(bt_buf),
@@ -2093,7 +2109,11 @@ static uint8_t App_HandleCompactFenceCmd(const char *text)
     if (count >= 3)
     {
       int i;
-      fence_add_polygon(id, (const double (*)[2])vertices, count);
+      if (!fence_add_polygon(id, (const double (*)[2])vertices, count))
+      {
+        App_SendBtText("Fence set FAILED: FP invalid or list full\r\n");
+        return 1U;
+      }
 
       /* 蓝牙转发标准 FENCE_CFG:P 格式给App */
       int offset = snprintf(bt_buf, sizeof(bt_buf),
@@ -2159,7 +2179,11 @@ static uint8_t App_HandleCompactFenceCmd(const char *text)
     if (count >= 3)
     {
       int i;
-      fence_add_polygon(id, (const double (*)[2])vertices, count);
+      if (!fence_add_polygon(id, (const double (*)[2])vertices, count))
+      {
+        App_SendBtText("Fence set FAILED: FQ invalid or list full\r\n");
+        return 1U;
+      }
 
       /* 蓝牙转发展开后的标准 FENCE_CFG:P 格式 */
       int offset = snprintf(bt_buf, sizeof(bt_buf),
