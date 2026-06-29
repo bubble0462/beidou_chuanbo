@@ -55,6 +55,7 @@ void Error_Handler(void);
 /* USER CODE BEGIN EFP */
 void App_ControlInit(void);
 void App_UartRxCallback(UART_HandleTypeDef *huart);
+void App_UartRxEventCallback(UART_HandleTypeDef *huart, uint16_t size);
 void App_UartErrorCallback(UART_HandleTypeDef *huart);
 void App_GpioExtiCallback(uint16_t GPIO_Pin);
 void App_TimerElapsedCallback(TIM_HandleTypeDef *htim);

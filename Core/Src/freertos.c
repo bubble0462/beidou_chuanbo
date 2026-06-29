@@ -39,6 +39,8 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+#define APP_MAX_LINE_SIZE              512U
+
 typedef enum
 {
   APP_MODE_RD = 0,
@@ -56,8 +58,21 @@ typedef struct
 {
   uint8_t source;
   uint16_t length;
-  uint8_t data[255U + 1U];
+  uint8_t data[APP_MAX_LINE_SIZE + 1U];
 } app_line_msg_t;
+
+typedef struct
+{
+  volatile uint32_t rxBytes;
+  volatile uint32_t rxEvents;
+  volatile uint32_t completeFrames;
+  volatile uint32_t uartErrors;
+  volatile uint32_t rxRestarts;
+  volatile uint32_t rxRestartFailures;
+  volatile uint32_t frameOverflows;
+  volatile uint32_t queueDrops;
+  volatile uint32_t lastHalError;
+} app_rd_rx_stats_t;
 
 typedef struct
 {
@@ -68,13 +83,13 @@ typedef struct
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define APP_MAX_LINE_SIZE              255U
 #define APP_BT_QUEUE_DEPTH             4U
 #define APP_MODULE_QUEUE_DEPTH         6U
+#define APP_RD_DMA_BUFFER_SIZE         1024U
 #define APP_POWER_OFF_TICKS            180U
 #define APP_DEBOUNCE_MS                80U
 #define APP_CONTROL_TASK_DELAY_MS      20U
-#define APP_RD_MODE_SETTLE_MS          300U
+#define APP_RD_MODE_SETTLE_MS          1000U
 #define APP_RN_RD_READY_DELAY_MS       2000U
 
 #define APP_BD2_TEXT_MAX_LEN           APP_LOCATION_REPORT_TEXT_MAX_LEN
@@ -88,8 +103,12 @@ typedef struct
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-static const uint8_t kCardQueryCommand[] = "$CCICR,0,00*68\r\n";
-static const uint8_t kBd2TxrEnableCommand[] = "$CCRMO,TXR,2,1*21\r\n";
+/* 北斗二号 RDSS 2.1 读卡指令：$CCICA,0,00*7B，预期模块回复 $BDICI,<卡号>,...
+ * （曾误用北斗三号 $CCICR，无法得到北二卡号，已按用户确认改正。） */
+static const uint8_t kCardQueryCommand[] = "$CCICA,0,00*7B\r\n";
+/* Keep one-second power/status output visible in the App raw log. */
+static const uint8_t kPwiOutputCommand[] = "$CCRMO,PWI,2,1*31\r\n";
+static const uint8_t kBsiOutputCommand[] = "$CCRMO,BSI,2,3*25\r\n";
 
 /* 北斗短报文卡号存储（可通过蓝牙设置） */
 static char g_selfCardId[16] = "0365966";
@@ -126,15 +145,21 @@ static uint32_t g_loopSendLastTick = 0U;
 static char g_loopSendMessage[APP_LOOP_SEND_MSG_MAX_LEN + 1U] = "SAFE";
 
 static uint8_t g_btRxByte = 0U;
-static uint8_t g_rdRxByte = 0U;
 static uint8_t g_gnssRxByte = 0U;
 
 static uint8_t g_btRxBuffer[APP_MAX_LINE_SIZE + 1U];
 static uint8_t g_rdRxBuffer[APP_MAX_LINE_SIZE + 1U];
 static uint8_t g_gnssRxBuffer[APP_MAX_LINE_SIZE + 1U];
+static uint8_t g_rdDmaBuffer[APP_RD_DMA_BUFFER_SIZE];
 static volatile uint16_t g_btRxLength = 0U;
 static volatile uint16_t g_rdRxLength = 0U;
 static volatile uint16_t g_gnssRxLength = 0U;
+static volatile uint16_t g_rdDmaReadPos = 0U;
+static volatile uint8_t g_rdDiscardUntilFrameStart = 0U;
+static app_rd_rx_stats_t g_rdRxStats = {0};
+static app_line_msg_t g_btQueueScratch;
+static app_line_msg_t g_rdQueueScratch;
+static app_line_msg_t g_gnssQueueScratch;
 
 static app_power_key_t g_powerKey = {0};
 /* USER CODE END Variables */
@@ -159,7 +184,7 @@ const osThreadAttr_t btTask_attributes = {
 osThreadId_t moduleTaskHandle;
 const osThreadAttr_t moduleTask_attributes = {
   .name = "moduleTask",
-  .stack_size = 512 * 4,
+  .stack_size = 768 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -224,11 +249,16 @@ static void App_HandlePowerKeyScan(void);
 static void App_ResetRxState(app_uart_source_t source);
 
 static void App_SendBt(const uint8_t *data, uint16_t length);
+static void App_SendBtLine(const uint8_t *data, uint16_t length);
 void App_SendBtText(const char *text);
 static void App_SendRd(const uint8_t *data, uint16_t length);
 
 static void App_HandleSosAction(void);
 static void App_RestartRx(UART_HandleTypeDef *huart);
+static HAL_StatusTypeDef App_StartRdDmaRx(void);
+static void App_PollRdDma(void);
+static void App_ProcessRdDmaRange(uint16_t start, uint16_t end);
+static void App_SendRdDiagnostics(void);
 static void App_ProcessRxByteFromIsr(app_uart_source_t source, uint8_t byte);
 static void App_QueueLineFromIsr(osMessageQueueId_t queue, app_uart_source_t source,
                                  uint8_t *buffer, volatile uint16_t *length);
@@ -329,6 +359,8 @@ void StartDefaultTask(void *argument)
 
   for (;;)
   {
+    App_PollRdDma();
+
     if ((rdModeSemaphoreHandle != NULL) && (osSemaphoreAcquire(rdModeSemaphoreHandle, 0U) == osOK))
     {
       App_SwitchMode(APP_MODE_RD);
@@ -526,6 +558,14 @@ static void App_StartRuntime(void)
 
   g_currentMode = APP_MODE_RN;
   App_SwitchMode(APP_MODE_RD);
+  /* 与岸基 BD_Init 对齐：上电即发 $CCICA 读一次本机卡。
+   * 模块必须读过 IC 卡、获知本机卡号后，才能接收发往本卡的短报文；
+   * 否则自发自收时只能发出(BDFKI)、收不到(BDTXR)。读到的 $BDICI 由 App 解析回填。 */
+  App_SendRd(kCardQueryCommand, (uint16_t)(sizeof(kCardQueryCommand) - 1U));
+  osDelay(800U);
+  App_SendRd(kPwiOutputCommand, (uint16_t)(sizeof(kPwiOutputCommand) - 1U));
+  osDelay(800U);
+  App_SendRd(kBsiOutputCommand, (uint16_t)(sizeof(kBsiOutputCommand) - 1U));
   App_SendBtText("System ready. Default mode: RD\r\n");
 
   /* Report battery status after power stabilized */
@@ -551,17 +591,7 @@ void App_UartRxCallback(UART_HandleTypeDef *huart)
   }
   else if (huart->Instance == USART1)
   {
-    if (g_currentMode == APP_MODE_RD)
-    {
-      App_ProcessRxByteFromIsr(APP_UART_SOURCE_RD, g_rdRxByte);
-    }
-    else
-    {
-      /* RN模式下保留RD数据接收，用于查看BDFKI发送反馈和调试 */
-      App_ProcessRxByteFromIsr(APP_UART_SOURCE_RD, g_rdRxByte);
-    }
-
-    App_RestartRx(&huart1);
+    /* USART1 is continuously received by DMA; data arrives via RxEvent. */
   }
   else if (huart->Instance == USART3)
   {
@@ -578,6 +608,19 @@ void App_UartRxCallback(UART_HandleTypeDef *huart)
   }
 }
 
+void App_UartRxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
+{
+  if ((huart == NULL) || (huart->Instance != USART1) ||
+      (size == 0U) || (size > APP_RD_DMA_BUFFER_SIZE))
+  {
+    return;
+  }
+
+  /* DMA is drained from the control task every 20 ms. The event remains a
+   * diagnostic signal only, so IDLE/HT/TC timing cannot batch App logs. */
+  g_rdRxStats.rxEvents++;
+}
+
 void App_UartErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart == NULL)
@@ -592,7 +635,10 @@ void App_UartErrorCallback(UART_HandleTypeDef *huart)
   }
   else if (huart->Instance == USART1)
   {
+    g_rdRxStats.uartErrors++;
+    g_rdRxStats.lastHalError = huart->ErrorCode;
     App_ResetRxState(APP_UART_SOURCE_RD);
+    (void)HAL_UART_AbortReceive(&huart1);
     App_RestartRx(&huart1);
   }
   else if (huart->Instance == USART3)
@@ -646,6 +692,28 @@ static void App_HandleBtMessage(const app_line_msg_t *msg)
     return;
   }
 
+  /* 只读查询当前通信模式：不切换模式、不触发 TXR 使能，供 App 连接后同步真实 RD/RN。
+   * 区别于 "rd mode"/"rn mode"（会切换并重新使能 TXR）。 */
+  if (App_CommandEquals(command, "mode get") != 0U)
+  {
+    App_SendBtText((g_currentMode == APP_MODE_RD) ? "Current mode: RD\r\n"
+                                                  : "Current mode: RN\r\n");
+    return;
+  }
+
+  if (App_CommandEquals(command, "rd diag") != 0U)
+  {
+    App_SendRdDiagnostics();
+    return;
+  }
+
+  if (App_CommandEquals(command, "rd diag reset") != 0U)
+  {
+    memset(&g_rdRxStats, 0, sizeof(g_rdRxStats));
+    App_SendBtText("RD diagnostics reset\r\n");
+    return;
+  }
+
   if (App_CommandEquals(command, "rd mode") != 0U)
   {
     if (rdModeSemaphoreHandle != NULL)
@@ -664,7 +732,10 @@ static void App_HandleBtMessage(const app_line_msg_t *msg)
     return;
   }
 
-  if (App_CommandEquals(command, "cardword") != 0U)
+  /* 卡号查询：兼容手工输入的 "cardword" 与 "card word" 两种写法（App 规范发送 cardword）。
+   * 仅 RD 模式向模块发起 CCICA 查询；RN 模式返回明确提示，不静默失败。 */
+  if ((App_CommandEquals(command, "cardword") != 0U) ||
+      (App_CommandEquals(command, "card word") != 0U))
   {
     if (g_currentMode == APP_MODE_RD)
     {
@@ -814,11 +885,16 @@ static void App_HandleBtMessage(const app_line_msg_t *msg)
   {
     App_SendRd(msg->data, msg->length);
   }
+  else if ((strncmp(command, "$cctxa", 6) == 0) || (strncmp(command, "cctxa", 5) == 0))
+  {
+    /* RN 模式下收到原始短报文发送请求：返回明确错误，不再静默丢弃。 */
+    App_SendBtText("CCTXA requires RD mode\r\n");
+  }
 }
 
 static void App_HandleModuleMessage(const app_line_msg_t *msg)
 {
-  uint8_t decoded[256];
+  uint8_t decoded[APP_MAX_LINE_SIZE + 1U];
   uint16_t decodedLen = 0U;
 
   if ((msg == NULL) || (msg->length == 0U))
@@ -845,7 +921,14 @@ static void App_HandleModuleMessage(const app_line_msg_t *msg)
     }
   }
 
-  App_SendBt(msg->data, msg->length);
+  if (msg->source == APP_UART_SOURCE_RD)
+  {
+    App_SendBtLine(msg->data, msg->length);
+  }
+  else
+  {
+    App_SendBt(msg->data, msg->length);
+  }
 }
 
 static void App_SwitchMode(app_mode_t mode)
@@ -871,7 +954,10 @@ static void App_SwitchMode(app_mode_t mode)
     }
 
     osDelay(APP_RD_MODE_SETTLE_MS);
-    App_SendRd(kBd2TxrEnableCommand, (uint16_t)(sizeof(kBd2TxrEnableCommand) - 1U));
+    /* 不发 $CCRMO,TXR：参照岸基 BD.c，模块默认就会自动输出收到的 $BDTXR/$BDTCI；
+     * 主动发 CCRMO,TXR 反而可能把模块切到“只输出 TX 上报”模式，抑制接收消息输出，
+     * 导致自发自收时只有 BDFKI、没有 BDTXR。$BDFKI 是 $CCTXA 的直接回包，不受影响。
+     * 下方字符串仅作 App 的 RD 就绪标记（App 依赖它解锁发送）。 */
     App_SendBtText("RD TXR output enabled\r\n");
   }
   else
@@ -957,6 +1043,7 @@ static void App_ResetRxState(app_uart_source_t source)
 
     case APP_UART_SOURCE_RD:
       g_rdRxLength = 0U;
+      g_rdDiscardUntilFrameStart = 0U;
       memset(g_rdRxBuffer, 0, sizeof(g_rdRxBuffer));
       break;
 
@@ -1035,6 +1122,120 @@ static void App_HandleSosAction(void)
   }
 }
 
+static HAL_StatusTypeDef App_StartRdDmaRx(void)
+{
+  HAL_StatusTypeDef status;
+
+  g_rdDmaReadPos = 0U;
+  status = HAL_UARTEx_ReceiveToIdle_DMA(&huart1, g_rdDmaBuffer, APP_RD_DMA_BUFFER_SIZE);
+  if (status == HAL_OK)
+  {
+    g_rdRxStats.rxRestarts++;
+  }
+  else
+  {
+    g_rdRxStats.rxRestartFailures++;
+  }
+
+  return status;
+}
+
+static void App_PollRdDma(void)
+{
+  uint16_t writePos;
+  uint16_t readPos;
+
+  if ((huart1.hdmarx == NULL) ||
+      (huart1.hdmarx->State != HAL_DMA_STATE_BUSY))
+  {
+    return;
+  }
+
+  writePos = (uint16_t)(APP_RD_DMA_BUFFER_SIZE -
+                        __HAL_DMA_GET_COUNTER(huart1.hdmarx));
+  if (writePos >= APP_RD_DMA_BUFFER_SIZE)
+  {
+    writePos = 0U;
+  }
+
+  readPos = g_rdDmaReadPos;
+  if (writePos == readPos)
+  {
+    return;
+  }
+
+  if (writePos > readPos)
+  {
+    App_ProcessRdDmaRange(readPos, writePos);
+  }
+  else
+  {
+    App_ProcessRdDmaRange(readPos, APP_RD_DMA_BUFFER_SIZE);
+    if (writePos > 0U)
+    {
+      App_ProcessRdDmaRange(0U, writePos);
+    }
+  }
+
+  g_rdDmaReadPos = writePos;
+}
+
+static void App_ProcessRdDmaRange(uint16_t start, uint16_t end)
+{
+  uint16_t index;
+
+  if ((start >= APP_RD_DMA_BUFFER_SIZE) ||
+      (end > APP_RD_DMA_BUFFER_SIZE) || (start >= end))
+  {
+    return;
+  }
+
+  g_rdRxStats.rxBytes += (uint32_t)(end - start);
+  for (index = start; index < end; index++)
+  {
+    App_ProcessRxByteFromIsr(APP_UART_SOURCE_RD, g_rdDmaBuffer[index]);
+  }
+}
+
+static void App_SendBtLine(const uint8_t *data, uint16_t length)
+{
+  static const uint8_t lineEnding[] = "\r\n";
+
+  if ((data == NULL) || (length == 0U) || (btTxMutexHandle == NULL))
+  {
+    return;
+  }
+
+  if (osMutexAcquire(btTxMutexHandle, osWaitForever) == osOK)
+  {
+    (void)HAL_UART_Transmit(&hlpuart1, (uint8_t *)data, length, HAL_MAX_DELAY);
+    (void)HAL_UART_Transmit(&hlpuart1, (uint8_t *)lineEnding,
+                            (uint16_t)(sizeof(lineEnding) - 1U), HAL_MAX_DELAY);
+    (void)osMutexRelease(btTxMutexHandle);
+  }
+}
+
+static void App_SendRdDiagnostics(void)
+{
+  char text[240];
+
+  (void)snprintf(text, sizeof(text),
+                 "RD diag bytes=%lu events=%lu frames=%lu errors=%lu "
+                 "restarts=%lu restart_fail=%lu overflow=%lu drops=%lu "
+                 "last_error=0x%08lX pos=%u\r\n",
+                 (unsigned long)g_rdRxStats.rxBytes,
+                 (unsigned long)g_rdRxStats.rxEvents,
+                 (unsigned long)g_rdRxStats.completeFrames,
+                 (unsigned long)g_rdRxStats.uartErrors,
+                 (unsigned long)g_rdRxStats.rxRestarts,
+                 (unsigned long)g_rdRxStats.rxRestartFailures,
+                 (unsigned long)g_rdRxStats.frameOverflows,
+                 (unsigned long)g_rdRxStats.queueDrops,
+                 (unsigned long)g_rdRxStats.lastHalError,
+                 (unsigned)g_rdDmaReadPos);
+  App_SendBtText(text);
+}
+
 static void App_RestartRx(UART_HandleTypeDef *huart)
 {
   if (huart == NULL)
@@ -1048,7 +1249,7 @@ static void App_RestartRx(UART_HandleTypeDef *huart)
   }
   else if (huart->Instance == USART1)
   {
-    (void)HAL_UART_Receive_IT(&huart1, &g_rdRxByte, 1U);
+    (void)App_StartRdDmaRx();
   }
   else if (huart->Instance == USART3)
   {
@@ -1078,19 +1279,37 @@ static void App_ProcessRxByteFromIsr(app_uart_source_t source, uint8_t byte)
       break;
 
     case APP_UART_SOURCE_RD:
-      if (g_rdRxLength < APP_MAX_LINE_SIZE)
+      if (byte == '$')
       {
+        g_rdRxLength = 0U;
+        g_rdDiscardUntilFrameStart = 0U;
         g_rdRxBuffer[g_rdRxLength++] = byte;
       }
-      else
+      else if (g_rdDiscardUntilFrameStart != 0U)
       {
-        App_QueueLineFromIsr(moduleQueueHandle, APP_UART_SOURCE_RD, g_rdRxBuffer, &g_rdRxLength);
-        g_rdRxBuffer[g_rdRxLength++] = byte;
+        /* Drop the damaged frame until '$' starts a fresh one. */
       }
-
-      if (byte == '\n')
+      else if ((byte == '\r') || (byte == '\n'))
       {
-        App_QueueLineFromIsr(moduleQueueHandle, APP_UART_SOURCE_RD, g_rdRxBuffer, &g_rdRxLength);
+        if (g_rdRxLength > 0U)
+        {
+          App_QueueLineFromIsr(moduleQueueHandle, APP_UART_SOURCE_RD,
+                               g_rdRxBuffer, &g_rdRxLength);
+        }
+      }
+      else if (g_rdRxLength > 0U)
+      {
+        if (g_rdRxLength < APP_MAX_LINE_SIZE)
+        {
+          g_rdRxBuffer[g_rdRxLength++] = byte;
+        }
+        else
+        {
+          g_rdRxStats.frameOverflows++;
+          g_rdRxLength = 0U;
+          g_rdDiscardUntilFrameStart = 1U;
+          memset(g_rdRxBuffer, 0, sizeof(g_rdRxBuffer));
+        }
       }
       break;
 
@@ -1119,7 +1338,7 @@ static void App_ProcessRxByteFromIsr(app_uart_source_t source, uint8_t byte)
 static void App_QueueLineFromIsr(osMessageQueueId_t queue, app_uart_source_t source,
                                  uint8_t *buffer, volatile uint16_t *length)
 {
-  app_line_msg_t message;
+  app_line_msg_t *message;
   uint16_t copyLength = 0U;
 
   if ((queue == NULL) || (buffer == NULL) || (length == NULL) || (*length == 0U))
@@ -1127,7 +1346,19 @@ static void App_QueueLineFromIsr(osMessageQueueId_t queue, app_uart_source_t sou
     return;
   }
 
-  memset(&message, 0, sizeof(message));
+  if (source == APP_UART_SOURCE_BT)
+  {
+    message = &g_btQueueScratch;
+  }
+  else if (source == APP_UART_SOURCE_RD)
+  {
+    message = &g_rdQueueScratch;
+  }
+  else
+  {
+    message = &g_gnssQueueScratch;
+  }
+  memset(message, 0, sizeof(*message));
 
   copyLength = *length;
   if (copyLength > APP_MAX_LINE_SIZE)
@@ -1135,12 +1366,22 @@ static void App_QueueLineFromIsr(osMessageQueueId_t queue, app_uart_source_t sou
     copyLength = APP_MAX_LINE_SIZE;
   }
 
-  message.source = (uint8_t)source;
-  message.length = copyLength;
-  memcpy(message.data, buffer, copyLength);
-  message.data[copyLength] = '\0';
+  message->source = (uint8_t)source;
+  message->length = copyLength;
+  memcpy(message->data, buffer, copyLength);
+  message->data[copyLength] = '\0';
 
-  (void)osMessageQueuePut(queue, &message, 0U, 0U);
+  if (osMessageQueuePut(queue, message, 0U, 0U) == osOK)
+  {
+    if (source == APP_UART_SOURCE_RD)
+    {
+      g_rdRxStats.completeFrames++;
+    }
+  }
+  else if (source == APP_UART_SOURCE_RD)
+  {
+    g_rdRxStats.queueDrops++;
+  }
 
   *length = 0U;
   memset(buffer, 0, APP_MAX_LINE_SIZE + 1U);

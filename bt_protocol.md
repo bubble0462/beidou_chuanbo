@@ -20,8 +20,11 @@
 |------|------|----------|
 | `rd mode` | 切换到 RD 模式（北斗短报文通信模式） | `Switched to RD mode\r\n` `RD TXR output enabled\r\n` |
 | `rn mode` | 切换到 RN 模式（GNSS 定位上报模式） | `Switched to RN mode\r\n` `RN RD standby ready\r\n` |
+| `mode get` | **只读查询**当前模式，不切换、不触发 TXR 使能 | `Current mode: RD\r\n` 或 `Current mode: RN\r\n` |
 
 > **注意**：切换模式不会清除卡号信息。RN 模式切换后约 2 秒才会输出 `RN RD standby ready`，App 等待该字符串后再发送后续指令。
+>
+> **RD 接收输出（自发自收关键）**：参照岸基 `BD.c`，进入 RD 时固件**不再发送** `$CCRMO,TXR`——模块默认就会把收到的异步短报文以 `$BDTXR,...`（北二）或 `$BDTCI,...`（北三）自动输出到串口，固件原样转发给 App。`$BDFKI`（发送应答）是 `$CCTXA` 的直接回包，不受影响。固件仍输出 `RD TXR output enabled` 字符串，但仅作 App 的 RD 就绪标记。
 
 ---
 
@@ -33,9 +36,12 @@
 | `self <卡号>` | 设置自身卡号 | `Self card set: 0365966\r\n` |
 | `get target` | 查询目标卡号 | `Target card: 0362746\r\n` |
 | `get self` | 查询自身卡号 | `Self card: 0365966\r\n` |
-| `cardword` | 查询自身卡号（仅 RD 模式，向模块发送查询指令） | 模块原始回复透传到蓝牙 |
+| `cardword` | 查询模块真实卡号（仅 RD 模式） | 模块 `$BDICI,...` 原始回复透传到蓝牙 |
+| `card word` | `cardword` 的兼容别名（手工输入带空格同样触发） | 同上 |
 
 > 卡号格式：4~12 位纯数字字符串。设置失败响应 `Invalid target card ID\r\n` 或 `Invalid self card ID\r\n`。
+>
+> **模块卡号查询**：固件使用北斗二号 RDSS 2.1 读卡指令 `$CCICA,0,00*7B\r\n`（曾误用北斗三号 `$CCICR`），预期模块回复 `$BDICI,<卡号>,<序列号>,...`。例如真机帧 `$BDICI,0242286,00242286,0000011,6,60,3,N,0*38` 中 `0242286` 是卡号，`00242286` 是序列号。App 收到后解析第 2 字段的 4~12 位纯数字卡号并回填「本机卡号」。
 
 ---
 
@@ -181,8 +187,12 @@ Loop sent [SAFE] to 0362746\r\n
 | `$BDFKI,...` | 北斗模块发送应答 | 解析第4字段（Y/N）判断是否发送成功 |
 | `$GNRMC,...` | GNSS 原始数据（RN 模式） | 可解析用于显示实时位置 |
 | `GNSS: pts=X ...` | 定位诊断日志（30秒一次） | 可展示在调试区或用于判断定位状态 |
-| `System ready. Default mode: RD\r\n` | 开机完成 | 触发 App 初始化流程 |
-| `RN RD standby ready\r\n` | RN 模式就绪 | 解锁 App 上报相关功能 |
+| `System ready. Default mode: RD\r\n` | 开机完成 | 触发 App 初始化流程；App 据此同步设备真实模式为 RD |
+| `RD TXR output enabled\r\n` | RD 模式发送通道就绪 | App 必须**收到此行后**才允许发送短报文 |
+| `Switched to RD/RN mode` / `Already in RD/RN mode` | 模式切换/确认回执 | App 据此同步设备真实模式；`Already in RD mode` 后固件仍会重新使能 TXR，App 须收到 `RD TXR output enabled` 才允许发送 |
+| `Current mode: RD/RN\r\n` | `mode get` 的只读回执 | App 连接后据此同步设备真实模式（**不切换模式**）；RD 仍须另有 `RD TXR output enabled` 才允许发送 |
+| `RN RD standby ready\r\n` | RN 模式就绪 | 解锁 App 上报相关功能；App 据此将设备模式同步为 RN |
+| `CCTXA requires RD mode\r\n` | RN 模式下收到原始 CCTXA 发送请求的明确错误 | App 应提示「需先切换 RD 模式」（不再静默丢弃） |
 | `Loop sent [...] to ...\r\n` | 循环发送成功 | 可更新 App 上次发送时间显示 |
 | `RN report sent: D\|...\r\n` | 定位上报成功 | 解析坐标更新地图 |
 
@@ -197,8 +207,9 @@ rn mode          → 切换 RN 模式
 target <id>      → 设置目标卡号
 self <id>        → 设置自身卡号
 get target       → 查询目标卡号
-get self         → 查询自身卡号
-cardword         → 模块卡号查询（RD 模式）
+get self         → 查询自身卡号（固件内存值）
+cardword         → 模块真实卡号查询（RD 模式，CCICA → $BDICI）
+card word        → cardword 兼容别名
 send <text>      → 发送短报文（RD 模式）
 sos              → 发送 SOS（RD 模式）
 report time <n>  → 定时上报，n≥1（分钟）

@@ -117,18 +117,27 @@ static void test_fence_state_machine(void)
 
   fence_add_circle(1U, 26.06543, 119.16302, 100.0);
 
+  /* 首次观测：建立基线（在外），不发报警 */
   fence_check_location(260376570U, 'N', 1190974952U, 'E');
   assert(fence_list[0].last_state == 2U);
 
+  /* 持续在外：状态不变 */
   fence_check_location(260376570U, 'N', 1190974952U, 'E');
   assert(fence_list[0].last_state == 2U);
 
+  /* 进入：R1 防抖需连续 FENCE_CONFIRM_SAMPLES 次才确认 */
+  fence_check_location(260392438U, 'N', 1190977779U, 'E');
+  assert(fence_list[0].last_state == 2U);
+  fence_check_location(260392438U, 'N', 1190977779U, 'E');
+  assert(fence_list[0].last_state == 2U);
   fence_check_location(260392438U, 'N', 1190977779U, 'E');
   assert(fence_list[0].last_state == 1U);
 
-  fence_check_location(260392438U, 'N', 1190977779U, 'E');
+  /* 驶出：同样需连续 FENCE_CONFIRM_SAMPLES 次确认 */
+  fence_check_location(260376570U, 'N', 1190974952U, 'E');
   assert(fence_list[0].last_state == 1U);
-
+  fence_check_location(260376570U, 'N', 1190974952U, 'E');
+  assert(fence_list[0].last_state == 1U);
   fence_check_location(260376570U, 'N', 1190974952U, 'E');
   assert(fence_list[0].last_state == 2U);
 }
@@ -144,12 +153,19 @@ static void test_circle_boundary(void)
 
   fence_add_circle(2U, 26.0, 119.0, 1000.0);
 
+  /* 首次观测：圆心，在内 */
   fence_check_location(260000000U, 'N', 1190000000U, 'E');
   assert(fence_list[0].last_state == 1U);
 
+  /* 移动但仍在内（~500m） */
   fence_check_location(260026976U, 'N', 1190000000U, 'E');
   assert(fence_list[0].last_state == 1U);
 
+  /* 移出到外（~1497m）：R1 防抖需连续 FENCE_CONFIRM_SAMPLES 次确认 */
+  fence_check_location(260080940U, 'N', 1190000000U, 'E');
+  assert(fence_list[0].last_state == 1U);
+  fence_check_location(260080940U, 'N', 1190000000U, 'E');
+  assert(fence_list[0].last_state == 1U);
   fence_check_location(260080940U, 'N', 1190000000U, 'E');
   assert(fence_list[0].last_state == 2U);
 }
@@ -358,10 +374,37 @@ static void test_fq_fence_detection(void)
   fence_check_location(260392438U, 'N', 1190977779U, 'E');
   assert(fence_list[0].last_state == 1U);
 
-  /* 围栏外部：远离围栏 */
+  /* 围栏外部：远离围栏。R1 防抖需连续 FENCE_CONFIRM_SAMPLES 次确认 */
+  fence_check_location(260000000U, 'N', 1190000000U, 'E');
+  assert(fence_list[0].last_state == 1U);
+  fence_check_location(260000000U, 'N', 1190000000U, 'E');
+  assert(fence_list[0].last_state == 1U);
   fence_check_location(260000000U, 'N', 1190000000U, 'E');
   assert(fence_list[0].last_state == 2U);
   printf("  FQ detection: inside/outside OK\n");
+}
+
+/* ==========================================================
+ * 测试 12: 半径上限（R7）与围栏列表满载（R4）返回值校验
+ * ========================================================== */
+static void test_radius_bound_and_full(void)
+{
+  /* R7：半径超限 / 非法应被拒绝且不落库 */
+  for (int i = 0; i < MAX_FENCES; i++) {
+    fence_list[i].is_active = false;
+  }
+  assert(fence_add_circle(1U, 26.0, 119.0, FENCE_MAX_RADIUS_M + 1.0) == false);
+  assert(fence_add_circle(1U, 26.0, 119.0, -10.0) == false);
+  assert(fence_list[0].is_active == false);
+  /* 合法半径应成功 */
+  assert(fence_add_circle(1U, 26.0, 119.0, 500.0) == true);
+
+  /* R4：围栏列表满载时新增应失败 */
+  for (int i = 0; i < MAX_FENCES - 1; i++) {
+    uint32_t id = (uint32_t)(100 + i);
+    assert(fence_add_circle(id, 26.0, 119.0, 200.0) == true);
+  }
+  assert(fence_add_circle(999U, 26.0, 119.0, 200.0) == false);
 }
 
 int main(void)
@@ -399,6 +442,9 @@ int main(void)
   test_fq_fence_detection();
   puts("[PASS] test_fq_fence_detection");
 
-  puts("\n=== all 11 fence tests passed ===");
+  test_radius_bound_and_full();
+  puts("[PASS] test_radius_bound_and_full");
+
+  puts("\n=== all 12 fence tests passed ===");
   return 0;
 }

@@ -1,0 +1,30 @@
+# Keil / MDK 构建产物
+MDK-ARM/beidou/*.o
+MDK-ARM/beidou/*.crf
+MDK-ARM/beidou/*.d
+MDK-ARM/beidou/*.axf
+MDK-ARM/beidou/*.hex
+MDK-ARM/beidou/*.htm
+MDK-ARM/beidou/*.map
+MDK-ARM/beidou/*.lnp
+MDK-ARM/beidou/*.sct
+MDK-ARM/beidou/*.dep
+MDK-ARM/beidou/*.build_log.htm
+MDK-ARM/beidou/*.lst
+MDK-ARM/beidou/uvgu.*
+MDK-ARM/*.uvgu.*
+MDK-ARM/RTE/_*/
+MDK-ARM/DebugConfig/
+MDK-ARM/Listings/
+MDK-ARM/Objects/
+MDK-ARM/*.bak
+MDK-ARM/*.png
+
+# 编译输出的测试可执行
+Tests/*.exe
+Tests/*.o
+Tests/*.obj
+
+# IDE
+*.uvguix.*
+JLinkLog.txt

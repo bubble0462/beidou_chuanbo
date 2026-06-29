@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "dma.h"
 #include "usart.h"
 #include "tim.h"
 #include "gpio.h"
@@ -94,6 +95,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_LPUART1_UART_Init();
   MX_USART3_UART_Init();
   MX_USART1_UART_Init();
@@ -177,6 +179,11 @@ void SystemClock_Config(void)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   App_UartRxCallback(huart);
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+  App_UartRxEventCallback(huart, Size);
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
